@@ -10,7 +10,7 @@ wheels/
 .venv
 
 *.jpeg
-*.jpf 
+*.jpg
 *.mov
 *.png
 *.mp4
