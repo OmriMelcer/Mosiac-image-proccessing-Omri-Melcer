@@ -1,0 +1,158 @@
+================================================================================
+HARRIS IMPROVEMENTS TEST RESULTS
+Date: December 30, 2025
+================================================================================
+
+CHANGES MADE:
+1. ✅ Increased max_corners from 50 to 100
+2. ✅ Changed to relative threshold (threshold * max_response), like OpenCV
+
+================================================================================
+RESULTS COMPARISON: 50 vs 100 Points
+================================================================================
+
+A. TRACKING SUCCESS RATE (100 points)
+Frame Pair | OpenCV    | Harris    | Difference
+--------------------------------------------------------
+0 -> 1     | 100.0%    | 87.0%     | -13.0%
+5 -> 6     | 99.0%     | 89.0%     | -10.0%
+10 -> 11   | 99.0%     | 81.0%     | -18.0%
+15 -> 16   | 98.0%     | 82.0%     | -16.0%
+20 -> 21   | 99.0%     | 82.0%     | -17.0%
+--------------------------------------------------------
+Average    | 99.0%     | 84.2%     | -14.8%
+
+B. PREVIOUS RESULTS (50 points)
+Frame Pair | OpenCV    | Harris    | Difference
+--------------------------------------------------------
+0 -> 1     | 100.0%    | 76.0%     | -24.0%
+5 -> 6     | 98.0%     | 86.0%     | -12.0%
+10 -> 11   | 100.0%    | 78.0%     | -22.0%
+15 -> 16   | 100.0%    | 74.0%     | -26.0%
+20 -> 21   | 98.0%     | 74.0%     | -24.0%
+--------------------------------------------------------
+Average    | 99.2%     | 77.6%     | -21.6%
+
+================================================================================
+ANALYSIS: Did the changes help?
+================================================================================
+
+✅ MODEST IMPROVEMENT:
+- Tracking success improved from 77.6% → 84.2% (+6.6 percentage points)
+- Gap reduced from 21.6% → 14.8% (-6.8 percentage points)
+- More points tracked: 84 vs 39 on average
+
+❌ STILL SIGNIFICANT GAP:
+- Harris still fails to track ~15 points per frame
+- OpenCV achieves near-perfect 99% success
+- 14.8% difference means fundamental issue remains
+
+================================================================================
+INLIERS COMPARISON
+================================================================================
+
+A. WITH 100 POINTS
+Frame Pair | OpenCV Inliers | Harris Inliers | Lost Tracks
+---------------------------------------------------------------
+0 -> 1     | 100           | 87             | -13
+5 -> 6     | 99            | 89             | -10
+10 -> 11   | 98            | 80             | -18
+15 -> 16   | 98            | 82             | -16
+20 -> 21   | 99            | 82             | -17
+---------------------------------------------------------------
+Average    | 98.8          | 84.0           | -14.8
+
+B. WITH 50 POINTS
+Frame Pair | OpenCV Inliers | Harris Inliers | Lost Tracks
+---------------------------------------------------------------
+Average    | 49.6          | 38.8           | -10.8
+
+OBSERVATION: 
+- Doubling points from 50→100 improved inliers from 39→84 (2.15x)
+- But gap also grew from 11→15 lost tracks
+- Diminishing returns: more points = more weak corners selected
+
+================================================================================
+ROOT CAUSE STILL PRESENT
+================================================================================
+
+The improvements confirm that:
+1. ✅ More points helps (6.6% better tracking)
+2. ✅ Relative threshold is correct (prevents image-dependent issues)
+
+But the core problem remains:
+❌ Our Harris detector still selects ~15% of points that cannot be tracked
+
+LIKELY CULPRITS (from code review):
+1. **NMS window too small (3x3)**
+   - Allows clustered points ~2 pixels apart
+   - OpenCV uses 3-pixel Euclidean distance minimum
+   - Clustered points have similar appearance → tracking fails
+
+2. **Small structure tensor window (3x3)**
+   - Makes Harris response noisy
+   - Selected corners may not be stable features
+
+3. **No sub-pixel refinement**
+   - Integer coordinates only
+   - Up to 0.5px positioning error
+
+================================================================================
+NEXT STEPS - RECOMMENDED FIXES
+================================================================================
+
+OPTION 1: IMPLEMENT MINIMUM DISTANCE FILTERING (HIGH PRIORITY)
+Instead of 3x3 NMS, enforce minimum Euclidean distance:
+
+```python
+def get_harris_points_with_min_distance(harris_response, threshold=0.01, 
+                                        max_corners=100, min_distance=3):
+    # After NMS and thresholding
+    coords = ... # get candidate points
+    values = ... # get their response values
+    
+    # Sort by response (descending)
+    sorted_idx = np.argsort(values)[::-1]
+    
+    # Greedily select points with minimum distance
+    selected = []
+    for idx in sorted_idx:
+        point = coords[idx]
+        # Check distance to all already selected points
+        if all(np.linalg.norm(point - sel) >= min_distance for sel in selected):
+            selected.append(point)
+            if len(selected) >= max_corners:
+                break
+    
+    return np.array(selected)
+```
+
+EXPECTED IMPACT: +5-10% tracking success
+
+OPTION 2: INCREASE STRUCTURE TENSOR WINDOW
+Change window_size from 3 to 5 or 7:
+```python
+harris_resp = harris_response(img1, window_size=5)
+```
+
+EXPECTED IMPACT: +2-5% tracking success
+
+OPTION 3: SPATIAL TILING (ALTERNATIVE APPROACH)
+Divide image into grid, take top N points per cell.
+Guarantees good distribution.
+
+EXPECTED IMPACT: +10-15% tracking success (most comprehensive)
+
+================================================================================
+RECOMMENDATION
+================================================================================
+
+Try fixes in this order:
+1. Minimum distance filtering (easiest, direct match to OpenCV)
+2. Larger structure tensor window (one-line change)
+3. If still not good enough: implement spatial tiling
+
+Current improvement (77.6% → 84.2%) is helpful but insufficient for 
+production use. Target: >95% tracking success to match OpenCV.
+
+================================================================================

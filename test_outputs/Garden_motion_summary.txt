@@ -1,0 +1,10 @@
+Motion Estimation Test: Garden.mp4
+Frames tested: 30
+
+Our Method:
+  Average time: 235.9 ms/frame
+  FPS: 4.2
+
+OpenCV Method:
+  Average time: 67.8 ms/frame
+  FPS: 14.7

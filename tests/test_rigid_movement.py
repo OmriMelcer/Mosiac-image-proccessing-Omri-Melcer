@@ -7,7 +7,7 @@ import sys
 # Ensure src can be imported
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from src.homography_evaluation import find_rigid_movement, apply_homography
+from src.homography_evaluation import find_rigid_movement, find_rigid_movement_pyramid, apply_homography
 
 def create_synthetic_cube(img_size=(200, 200), cube_size=50, cube_pos=(75, 75)):
     """Creates a black image with a white square, blurred for derivatives."""
@@ -310,51 +310,71 @@ def test_cumulative_rotation_zero_sum():
 
 
 
-def generate_random_sequence(img_base: np.ndarray, steps: int = 50):
+def generate_random_sequence(img_base: np.ndarray, steps: int = 50, motion_scale: float = 1.0, include_rotation: bool = False):
     """
     Generates a sequence of images with random movements.
-    Returns: List of (image, ground_truth_pose_abs) tuples.
-    Pose is (theta, tx, ty).
+    Returns: List of (image, ground_truth_H) tuples.
+    Ground truth H is the cumulative homography from base to current frame.
+    
+    Args:
+        motion_scale: Multiplier for motion magnitude.
+                      1.0 = small (0-0.4px per frame)
+                      5.0 = medium (0-2px per frame)
+                      10.0 = large (0-4px per frame)
+        include_rotation: If False, sets rotation to 0 (pure translation test)
     """
-    print(f"Generating sequence of {steps} frames...")
+    rotation_status = "with rotation" if include_rotation else "translation only"
+    print(f"Generating sequence of {steps} frames (motion_scale={motion_scale}, {rotation_status})...")
     
     sequence = []
     
-    # Initial state
-    current_tx = 0.0
-    current_ty = 0.0
-    current_theta = 0.0
+    # Cumulative homography from base image
+    cumulative_H = np.eye(3)
     
-    # Store initial
-    sequence.append((img_base, (current_theta, current_tx, current_ty)))
+    # Store initial (identity transform)
+    sequence.append((img_base, cumulative_H.copy()))
     
     for _ in range(steps):
-        # User Specs:
-        # y: random [-0.4, 0.4]
-        # theta: random [-0.1, 0.1]
-        # x: steady [0, 0.8] -> Uniform(0, 0.8) ensures steady positive drift
+        # Generate incremental motion (scaled by motion_scale)
+        d_x = np.random.uniform(0.0, 0.4 * motion_scale)
+        d_y = np.random.uniform(-0.2 * motion_scale, 0.2 * motion_scale)
+        d_theta = 0.0 if not include_rotation else np.random.uniform(-0.1 * motion_scale, 0.1 * motion_scale)
         
-        d_x = np.random.uniform(0.0, 0.4)
-        d_y = np.random.uniform(-0.2, 0.2)
-        d_theta = np.random.uniform(-0.1, 0.1)
+        # Create incremental transformation matrix
+        theta_rad = np.deg2rad(d_theta)
+        cos_t = np.cos(theta_rad)
+        sin_t = np.sin(theta_rad)
         
-        current_tx += d_x
-        current_ty += d_y
-        current_theta += d_theta
+        H_increment = np.array([
+            [cos_t, -sin_t, d_x],
+            [sin_t, cos_t, d_y],
+            [0, 0, 1]
+        ])
         
-        # Warp
-        img_curr, _ = warp_image(img_base, current_theta, current_tx, current_ty)
-        sequence.append((img_curr, (current_theta, current_tx, current_ty)))
+        # Compose: new_cumulative = H_increment @ cumulative_H
+        cumulative_H = H_increment @ cumulative_H
+        
+        # Extract absolute parameters for warp_image
+        abs_theta = np.degrees(np.arctan2(cumulative_H[1, 0], cumulative_H[0, 0]))
+        abs_tx = cumulative_H[0, 2]
+        abs_ty = cumulative_H[1, 2]
+        
+        # Warp image from base using absolute transform
+        img_curr, _ = warp_image(img_base, abs_theta, abs_tx, abs_ty)
+        sequence.append((img_curr, cumulative_H.copy()))
         
     return sequence
 
-def process_sequence_benchmark(sequence):
+def process_sequence_benchmark(sequence, use_pyramid=False):
     """
     Runs tracking on the generated sequence and benchmarks time.
+    Args:
+        use_pyramid: If True, uses find_rigid_movement_pyramid
     """
     import time
     
-    print(f"Processing sequence of {len(sequence)} frames...")
+    method_name = "Pyramid LK" if use_pyramid else "Iterative LK"
+    print(f"Processing sequence of {len(sequence)} frames using {method_name}...")
     
     errors_tx = []
     errors_ty = []
@@ -367,46 +387,41 @@ def process_sequence_benchmark(sequence):
     start_time = time.time()
     
     img_prev = sequence[0][0]
-    prev_pose = sequence[0][1] # (theta, tx, ty)
+    prev_H_gt = sequence[0][1]  # Ground truth homography
     
-    # We track incrementally, so we integrate estimated deltas
-    # To compare with Abs Pose ground truth
-    abs_est_tx = prev_pose[1]
-    abs_est_ty = prev_pose[2]
-    abs_est_theta = prev_pose[0]
+    # Start with identity (no accumulated estimation yet)
+    cumulative_H_est = np.eye(3)
     
     for i in range(1, len(sequence)):
         img_curr = sequence[i][0]
-        gt_pose = sequence[i][1] # (theta, tx, ty)
+        H_gt_curr = sequence[i][1]  # Ground truth cumulative homography
         
         # Track
+        tracking_func = find_rigid_movement_pyramid if use_pyramid else find_rigid_movement
         step_start = time.time()
-        H_est, matched = find_rigid_movement(img_prev, img_curr)
+        H_est_increment, matched = tracking_func(img_prev, img_curr)
         step_end = time.time()
         
-        if H_est is None:
+        if H_est_increment is None:
             print(f"  Frame {i}: Tracking Lost! (H_est is None)")
-            # Assume 0 motion for this failed step
-            d_tx = 0.0
-            d_ty = 0.0
-            d_theta = 0.0
-        else:
-            # Extract relative motion
-            d_tx = H_est[0, 2]
-            d_ty = H_est[1, 2]
-            d_theta = np.degrees(np.arctan2(H_est[1, 0], H_est[0, 0]))
+            # Assume identity (no motion) for this failed step
+            H_est_increment = np.eye(3)
         
-        # Update Estimates
-        abs_est_tx += d_tx
-        abs_est_ty += d_ty
-        abs_est_theta += d_theta
+        # Compose: cumulative = H_increment @ cumulative
+        cumulative_H_est = H_est_increment @ cumulative_H_est
         
-        # Compare with Ground Truth Abs
-        gt_theta, gt_tx, gt_ty = gt_pose
+        # Extract parameters for comparison
+        est_theta = np.degrees(np.arctan2(cumulative_H_est[1, 0], cumulative_H_est[0, 0]))
+        est_tx = cumulative_H_est[0, 2]
+        est_ty = cumulative_H_est[1, 2]
         
-        err_x = abs_est_tx - gt_tx
-        err_y = abs_est_ty - gt_ty
-        err_t = abs_est_theta - gt_theta
+        gt_theta = np.degrees(np.arctan2(H_gt_curr[1, 0], H_gt_curr[0, 0]))
+        gt_tx = H_gt_curr[0, 2]
+        gt_ty = H_gt_curr[1, 2]
+        
+        err_x = est_tx - gt_tx
+        err_y = est_ty - gt_ty
+        err_t = est_theta - gt_theta
         
         errors_tx.append(err_x)
         errors_ty.append(err_y)
@@ -419,7 +434,7 @@ def process_sequence_benchmark(sequence):
     total_time = time.time() - start_time
     avg_fps = (len(sequence)-1) / total_time
     
-    print(f"--- Benchmark Results ---")
+    print(f"--- {method_name} Benchmark Results ---")
     print(f"Total Time: {total_time:.2f}s for {len(sequence)-1} pairs.")
     print(f"Average FPS: {avg_fps:.2f}")
     
@@ -431,22 +446,53 @@ def process_sequence_benchmark(sequence):
 def test_random_jitter_benchmark():
     print("\n--- Test 8: Random Jitter Benchmark (50 Steps) ---")
     
-    # 1. Generate Synthetic Sequence
-    print("\n[Synthetic Cube]")
     img_syn = create_synthetic_cube()
-    seq_syn = generate_random_sequence(img_syn, steps=50)
-    process_sequence_benchmark(seq_syn)
     
-    # 2. Generate Real Sequence
+    # Test 1: Small Motion - Translation Only
+    print("\n" + "="*60)
+    print("=== SMALL MOTION (0-0.4px per frame, TRANSLATION ONLY) ===")
+    print("="*60)
+    seq_small = generate_random_sequence(img_syn, steps=50, motion_scale=1.0, include_rotation=False)
+    print("\n[Iterative LK]")
+    process_sequence_benchmark(seq_small, use_pyramid=False)
+    print("\n[Pyramid LK]")
+    process_sequence_benchmark(seq_small, use_pyramid=True)
+    
+    # Test 2: Medium Motion - Translation Only
+    print("\n" + "="*60)
+    print("=== MEDIUM MOTION (0-2px per frame, TRANSLATION ONLY) ===")
+    print("="*60)
+    seq_medium = generate_random_sequence(img_syn, steps=50, motion_scale=5.0, include_rotation=False)
+    print("\n[Iterative LK - expected to struggle]")
+    process_sequence_benchmark(seq_medium, use_pyramid=False)
+    print("\n[Pyramid LK - expected to succeed]")
+    process_sequence_benchmark(seq_medium, use_pyramid=True)
+    
+    # Test 3: Large Motion - Translation Only
+    print("\n" + "="*60)
+    print("=== LARGE MOTION (0-4px per frame, TRANSLATION ONLY) ===")
+    print("="*60)
+    seq_large = generate_random_sequence(img_syn, steps=50, motion_scale=10.0, include_rotation=False)
+    print("\n[Iterative LK - expected to fail]")
+    process_sequence_benchmark(seq_large, use_pyramid=False)
+    print("\n[Pyramid LK - expected to succeed]")
+    process_sequence_benchmark(seq_large, use_pyramid=True)
+    
+    # Test 4: Real Image with Medium Motion - Translation Only
     if os.path.exists("test1.jpg"):
-        print("\n[Real Image]")
+        print("\n" + "="*60)
+        print("=== REAL IMAGE - MEDIUM MOTION (TRANSLATION ONLY) ===")
+        print("="*60)
         img_real = cv2.imread("test1.jpg")
         img_real = cv2.cvtColor(img_real, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        img_real = cv2.GaussianBlur(img_real, (5, 5), 1.0) # Always blur
-        seq_real = generate_random_sequence(img_real, steps=50)
-        process_sequence_benchmark(seq_real)
+        img_real = cv2.GaussianBlur(img_real, (5, 5), 1.0)
+        seq_real = generate_random_sequence(img_real, steps=50, motion_scale=5.0, include_rotation=False)
+        print("\n[Iterative LK]")
+        process_sequence_benchmark(seq_real, use_pyramid=False)
+        print("\n[Pyramid LK]")
+        process_sequence_benchmark(seq_real, use_pyramid=True)
         
-        print("\n--- OpenCV Baseline Benchmark ---")
+        print("\n[OpenCV Baseline]")
         process_sequence_benchmark_cv2(seq_real)
 
 def process_sequence_benchmark_cv2(sequence):
@@ -464,9 +510,7 @@ def process_sequence_benchmark_cv2(sequence):
     errors_ty = []
     errors_theta = []
     
-    abs_est_tx = sequence[0][1][1]
-    abs_est_ty = sequence[0][1][2]
-    abs_est_theta = sequence[0][1][0]
+    cumulative_H_est = np.eye(3)
     
     start_time = time.time()
     
@@ -475,7 +519,7 @@ def process_sequence_benchmark_cv2(sequence):
     
     for i in range(1, len(sequence)):
         img_curr = sequence[i][0].astype(np.uint8)
-        gt_pose = sequence[i][1]
+        H_gt_curr = sequence[i][1]
         
         # 1. Detect
         p0 = cv2.goodFeaturesToTrack(img_prev, maxCorners=50, qualityLevel=0.01, minDistance=3)
@@ -507,26 +551,26 @@ def process_sequence_benchmark_cv2(sequence):
                 p2_our = good_new[:, [1, 0]]
                 
                 from src.homography_evaluation import ransac_rigid_movement
-                H_est, inliers = ransac_rigid_movement(p1_our, p2_our)
+                H_est_increment, inliers = ransac_rigid_movement(p1_our, p2_our)
                 
-                if H_est is None:
-                    d_tx, d_ty, d_theta = 0, 0, 0
-                else:
-                    d_tx = H_est[0, 2]
-                    d_ty = H_est[1, 2]
-                    d_theta = np.degrees(np.arctan2(H_est[1, 0], H_est[0, 0]))
+                if H_est_increment is None:
+                    H_est_increment = np.eye(3)
 
-        # Update Estimates
-        abs_est_tx += d_tx
-        abs_est_ty += d_ty
-        abs_est_theta += d_theta
+        # Compose cumulative transformation
+        cumulative_H_est = H_est_increment @ cumulative_H_est
         
-        # Compare
-        gt_theta, gt_tx, gt_ty = gt_pose
+        # Extract parameters
+        est_tx = cumulative_H_est[0, 2]
+        est_ty = cumulative_H_est[1, 2]
+        est_theta = np.degrees(np.arctan2(cumulative_H_est[1, 0], cumulative_H_est[0, 0]))
         
-        errors_tx.append(abs_est_tx - gt_tx)
-        errors_ty.append(abs_est_ty - gt_ty)
-        errors_theta.append(abs_est_theta - gt_theta)
+        gt_tx = H_gt_curr[0, 2]
+        gt_ty = H_gt_curr[1, 2]
+        gt_theta = np.degrees(np.arctan2(H_gt_curr[1, 0], H_gt_curr[0, 0]))
+        
+        errors_tx.append(est_tx - gt_tx)
+        errors_ty.append(est_ty - gt_ty)
+        errors_theta.append(est_theta - gt_theta)
         
         img_prev = img_curr
 

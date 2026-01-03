@@ -1,0 +1,26 @@
+Full Video Comparison: House.mp4
+================================================================================
+
+Video: 435 frames, (720, 1280)
+
+Our Method: 3.47 FPS, Avg Inliers: 40.6
+  Final Cumulative: TX=-675.91, TY=-25.78, Theta=0.982°
+
+OpenCV Method: 23.68 FPS, Avg Inliers: 85.5
+  Final Cumulative: TX=-676.65, TY=-23.36, Theta=0.956°
+
+Hybrid Method: 4.50 FPS, Avg Inliers: 94.1
+  Final Cumulative: TX=-679.85, TY=-30.58, Theta=1.324°
+
+Performance: OpenCV is 6.83x faster
+
+Accuracy Differences (Our vs OpenCV):
+  TX: Mean=0.371px, Std=0.462px, Max=1.205px
+  TY: Mean=1.317px, Std=1.591px, Max=3.584px
+  Theta: Mean=0.059°, Std=0.059°, Max=0.148°
+  Final Cumulative Difference: TX=0.739px, TY=-2.419px, Theta=0.026°
+Accuracy Differences (Hybrid vs OpenCV):
+  TX: Mean=2.707px, Std=1.358px, Max=4.836px
+  TY: Mean=4.671px, Std=5.314px, Max=12.451px
+  Theta: Mean=0.251°, Std=0.282°, Max=0.594°
+  Final Cumulative Difference: TX=-3.200px, TY=-7.216px, Theta=0.369°

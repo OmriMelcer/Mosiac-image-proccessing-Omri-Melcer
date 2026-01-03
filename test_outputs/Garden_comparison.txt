@@ -1,0 +1,26 @@
+Full Video Comparison: Garden.mp4
+================================================================================
+
+Video: 488 frames, (720, 1280)
+
+Our Method: 2.64 FPS, Avg Inliers: 88.5
+  Final Cumulative: TX=-448.28, TY=-60.23, Theta=3.918°
+
+OpenCV Method: 23.72 FPS, Avg Inliers: 99.8
+  Final Cumulative: TX=-465.07, TY=-63.37, Theta=4.152°
+
+Hybrid Method: 3.26 FPS, Avg Inliers: 191.3
+  Final Cumulative: TX=-485.60, TY=-46.89, Theta=3.180°
+
+Performance: OpenCV is 8.97x faster
+
+Accuracy Differences (Our vs OpenCV):
+  TX: Mean=8.636px, Std=4.466px, Max=16.792px
+  TY: Mean=1.468px, Std=1.584px, Max=3.625px
+  Theta: Mean=0.090°, Std=0.099°, Max=0.234°
+  Final Cumulative Difference: TX=16.792px, TY=3.144px, Theta=-0.234°
+Accuracy Differences (Hybrid vs OpenCV):
+  TX: Mean=9.520px, Std=6.664px, Max=20.557px
+  TY: Mean=6.608px, Std=4.373px, Max=16.487px
+  Theta: Mean=0.410°, Std=0.257°, Max=0.972°
+  Final Cumulative Difference: TX=-20.536px, TY=16.487px, Theta=-0.972°
