@@ -1,0 +1,31 @@
+=== MOSAIC ONE COLUMN STITCHING LOG ===
+Total frames: 20
+Canvas width: 259
+Frame width: 240
+Column to build: 120
+cum_tx: -190.0
+Direction: left-to-right (tx negative)
+
+=== LEFT-TO-RIGHT STITCHING ===
+Frame 0: Placed left portion [:, 0:120, :]
+Frame 0: SKIPPED (tx=0 >= 0)
+Frame 1: tx=-1, extract [120:121] -> canvas [120:121]
+Frame 2: tx=-1, extract [120:121] -> canvas [121:122]
+Frame 3: tx=-1, extract [120:121] -> canvas [122:123]
+Frame 4: tx=-1, extract [120:121] -> canvas [123:124]
+Frame 5: tx=-1, extract [120:121] -> canvas [124:125]
+Frame 6: tx=-1, extract [120:121] -> canvas [125:126]
+Frame 7: tx=-1, extract [120:121] -> canvas [126:127]
+Frame 8: tx=-1, extract [120:121] -> canvas [127:128]
+Frame 9: tx=-1, extract [120:121] -> canvas [128:129]
+Frame 10: tx=-1, extract [120:121] -> canvas [129:130]
+Frame 11: tx=-1, extract [120:121] -> canvas [130:131]
+Frame 12: tx=-1, extract [120:121] -> canvas [131:132]
+Frame 13: tx=-1, extract [120:121] -> canvas [132:133]
+Frame 14: tx=-1, extract [120:121] -> canvas [133:134]
+Frame 15: tx=-1, extract [120:121] -> canvas [134:135]
+Frame 16: tx=-1, extract [120:121] -> canvas [135:136]
+Frame 17: tx=-1, extract [120:121] -> canvas [136:137]
+Frame 18: tx=-1, extract [120:121] -> canvas [137:138]
+Frame 19: tx=-1, extract [120:121] -> canvas [138:139]
+Final: Placed right portion of frame 19 [:, 120:, :] -> canvas [:, 139:, :]

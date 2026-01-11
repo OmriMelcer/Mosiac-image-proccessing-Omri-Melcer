@@ -420,10 +420,6 @@ def find_rigid_movement_pyramid(img1: np.ndarray, img2: np.ndarray, target_pixel
             img1 = cv2.resize(img1, (new_w, new_h), interpolation=cv2.INTER_AREA)
             img2 = cv2.resize(img2, (new_w, new_h), interpolation=cv2.INTER_AREA)
     
-    # Apply Gaussian Blur to reduce noise and improve tracking stability
-    img1 = cv2.GaussianBlur(img1, (5, 5), 0)
-    img2 = cv2.GaussianBlur(img2, (5, 5), 0)
-
     # Increased pyramid levels to 5 to handle larger motion (e.g. 25px)
     im_1_pyr = build_pyramid(img1, num_levels=5)
     im_2_pyr = build_pyramid(img2, num_levels=5)
@@ -535,22 +531,47 @@ def find_rigid_movement_opencv_with_our_ransac(img1: np.ndarray, img2: np.ndarra
     if p0_cv is None or len(p0_cv) < 2:
         return None, np.array([])
     
-    # 2. Track using OpenCV's calcOpticalFlowPyrLK
-    p1_cv, st_cv, err_cv = cv2.calcOpticalFlowPyrLK(
-        img1_uint, img2_uint, p0_cv, None,
-        winSize=(15, 15), maxLevel=2
-    )
+    current_img1 = img1_uint.copy()
+    current_img2 = img2_uint.copy()
     
-    # 3. Get successful tracks
-    good_old = p0_cv[st_cv == 1]
-    good_new = p1_cv[st_cv == 1]
+    best_len = -1
+    best_p1_our = None
+    best_p2_our = None
     
-    if len(good_old) < 2:
+    # Try up to 5 times with increasing blur just for tracking
+    for i in range(5):
+        # 2. Track using OpenCV's calcOpticalFlowPyrLK
+        p1_cv, st_cv, err_cv = cv2.calcOpticalFlowPyrLK(
+            current_img1, current_img2, p0_cv, None,
+            winSize=(15, 15), maxLevel=2
+        )
+        
+        if p1_cv is not None:
+             good_old = p0_cv[st_cv == 1]
+             good_new = p1_cv[st_cv == 1]
+             
+             curr_len = len(good_old)
+             if curr_len > best_len:
+                 best_len = curr_len
+                 # 4. Convert to our format (y, x) immediately to save state
+                 if curr_len >= 2:
+                     best_p1_our = good_old.squeeze()[:, [1, 0]]
+                     best_p2_our = good_new.squeeze()[:, [1, 0]]
+                 
+             # Success condition: tracked > 60% of points
+             if len(p0_cv) > 0 and curr_len / len(p0_cv) > 0.6:
+                 break
+                 
+        # Blur for next iteration
+        if i < 4:
+            current_img1 = cv2.GaussianBlur(current_img1, (5, 5), 1)
+            current_img2 = cv2.GaussianBlur(current_img2, (5, 5), 1)
+    
+    if best_p1_our is None or len(best_p1_our) < 2:
         return None, np.array([])
-    
-    # 4. Convert to our format (y, x) - OpenCV returns (x, y)
-    p1_our = good_old.squeeze()[:, [1, 0]]  # (x,y) -> (y,x)
-    p2_our = good_new.squeeze()[:, [1, 0]]  # (x,y) -> (y,x)
+        
+    p1_our = best_p1_our
+    p2_our = best_p2_our
     
     # 5. Use OUR RANSAC
     H, inliers = ransac_rigid_movement(p1_our, p2_our)

@@ -6,18 +6,57 @@ from typing import List, Tuple, Union
 def load_video(path: str) -> np.ndarray:
     """
     Loads a video from the specified path.
+    Checks for high resolution and frame rate; downsamples if necessary to avoid aliasing.
     Returns:
         np.ndarray: Video data as (frames, height, width) or (frames, height, width, channels).
     """
+    MAX_DIMENSION = 1280
+    TARGET_FPS = 30
+
     cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {path}")
+
+    # Get video properties
+    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    # Calculate scale factor
+    scale = 1.0
+    max_dim = max(width, height)
+    if max_dim > MAX_DIMENSION:
+        scale = MAX_DIMENSION / max_dim
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        print(f"Downsampling video {path} from {int(width)}x{int(height)} to {new_width}x{new_height}")
+    else:
+        new_width, new_height = int(width), int(height)
+
+    # Calculate frame skip
+    frame_skip = 1
+    if fps > TARGET_FPS + 5:  # Allow some tolerance
+        frame_skip = int(round(fps / TARGET_FPS))
+        print(f"Reducing frame rate of {path} from {fps:.2f} to ~{fps/frame_skip:.2f} fps (skip factor: {frame_skip})")
+
     frames = []
+    frame_count = 0
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        # OpenCV loads as BGR, convert to RGB
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frames.append(frame)
+
+        if frame_count % frame_skip == 0:
+            if scale < 1.0:
+                # Use INTER_AREA to avoid aliasing when downsampling
+                frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+            # OpenCV loads as BGR, convert to RGB
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+
+        frame_count += 1
+
     cap.release()
     return np.array(frames)
 
@@ -28,9 +67,17 @@ def save_video(frames: np.ndarray, path: str, fps: int = 30):
     if len(frames) == 0:
         return
     height, width = frames[0].shape[:2]
-    # fourcc = cv2.VideoWriter_fourcc(*'mp4v') # For MP4
-    fourcc = cv2.VideoWriter_fourcc(*'XVID') # Safer for AVI across systems
+    # Use H264 codec for better compatibility, fallback to mp4v
+    if path.endswith('.mp4'):
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H264 codec
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
     out = cv2.VideoWriter(path, fourcc, fps, (width, height))
+    
+    if not out.isOpened():
+        # Fallback to mp4v if avc1 fails
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(path, fourcc, fps, (width, height))
     
     for frame in frames:
         # Expecting RGB, convert back to BGR for OpenCV

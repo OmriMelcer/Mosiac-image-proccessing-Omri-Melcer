@@ -3,13 +3,8 @@ from typing import List, Tuple
 from . import homography_evaluation as he
 from scipy.ndimage import affine_transform, gaussian_filter
 from skimage import color as sk
+import cv2
 
-def find_optimal_reference_frame(transforms: List[np.ndarray]) -> int:
-    """
-    Finds the reference frame index that minimizes global distortion.
-    Based on the median of cumulative rotation and Y-translation.
-    """
-    pass
 
 def normalize_vertical_motion(frames: np.ndarray, transforms: List[np.ndarray]) -> Tuple[np.ndarray, List[np.ndarray], bool]:
     """
@@ -21,7 +16,67 @@ def normalize_vertical_motion(frames: np.ndarray, transforms: List[np.ndarray]) 
     # TODO: will be implimented later - for now Only horizontal panoramas are supported.
     pass
 
-def get_first_to_last_transform (frames: np.ndarray, func_transform_to_stabilization = get_stabilization_transform):
+def calculate_safe_margins(frames_shape: Tuple[int, int], true_transforms: np.ndarray) -> Tuple[int, int]:
+    """
+    Calculates the safe horizontal margins to avoid black triangular regions caused by rotation/stabilization.
+    Returns (safe_min_x, safe_max_x)
+    """
+    h, w = frames_shape[0], frames_shape[1]
+    corners = np.array([
+        [0, 0, 1],
+        [w, 0, 1],
+        [w, h, 1],
+        [0, h, 1]
+    ]).T  # 3x4 matrix
+
+    min_valid_x_list = []
+    max_valid_x_list = []
+
+    for H in true_transforms:
+        # We need to map the Input Frame corners to the Output (Stabilized) Frame.
+        # apply_stabilization uses affine_transform(..., H, ...).
+        # This implies H maps Output -> Input.
+        # So to map Input -> Output, we need inv(H).
+        try:
+            inv_H = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            continue
+
+        # Map corners: X_out = inv_H * X_in
+        transformed_corners = np.dot(inv_H, corners)
+        # Normalize by z (though for affine it should be 1)
+        transformed_corners /= transformed_corners[2, :]
+        
+        x_coords = transformed_corners[0, :]
+        
+        # For a rotated rectangle, the "valid" region for a full vertical strip
+        # is bounded by the "innermost" corners.
+        # Left bound: max(Top-Left X, Bottom-Left X)
+        # Right bound: min(Top-Right X, Bottom-Right X)
+        
+        # Corners order: TL(0), TR(1), BR(2), BL(3)
+        x_tl, x_tr, x_br, x_bl = x_coords[0], x_coords[1], x_coords[2], x_coords[3]
+        
+        current_min_valid = max(x_tl, x_bl)
+        current_max_valid = min(x_tr, x_br)
+        
+        min_valid_x_list.append(current_min_valid)
+        max_valid_x_list.append(current_max_valid)
+
+    # We need a margin that is safe for ALL frames
+    if not min_valid_x_list:
+        return 0, w
+
+    global_safe_min = int(np.ceil(np.max(min_valid_x_list)))
+    global_safe_max = int(np.floor(np.min(max_valid_x_list)))
+    
+    # Clamp to image bounds
+    global_safe_min = max(0, global_safe_min)
+    global_safe_max = min(w, global_safe_max)
+    
+    return global_safe_min, global_safe_max
+
+def get_first_to_last_transform (frames: np.ndarray, anchor_index_locator_func):
     """
     input: frames as a sequence of images ,shape (frames, height, width) (grey scale)
     output: transition transforms to stabalize the frames, anchor index, max change in x. 
@@ -51,12 +106,37 @@ def get_first_to_last_transform (frames: np.ndarray, func_transform_to_stabiliza
         d_theta[i] = np.arctan2(accumaltive_transforms[i,1,0], accumaltive_transforms[i,0,0])
         min_y = min(min_y, dy[i])
         max_y = max(max_y, dy[i])
-    median_theta = np.median(d_theta)
-    anchor = np.argmin(np.abs(d_theta - median_theta))
+    # median_theta = np.median(d_theta)
+    # anchor = np.argmin(np.abs(d_theta - median_theta))
+    anchor = anchor_index_locator_func(dy, d_theta)
     new_transforms = recalculate_transforms(accumaltive_transforms, anchor)
     global_x_change = new_transforms[:,0,2].copy()
-    true_transform = func_transform_to_stabilization(new_transforms,anchor)
+    true_transform = get_stabilization_transform(new_transforms)
     return true_transform, transforms,anchor, global_x_change
+
+def get_anchor_frame_by_mean_dy(dy: np.ndarray, d_theta: np.ndarray) -> int:
+    """
+    Finds the anchor frame index based on mean Y-translation.
+    """
+    mean_dy = np.mean(dy)
+    anchor = np.argmin(np.abs(dy - mean_dy))
+    return anchor
+
+def get_anchor_frame_by_median_dy(dy: np.ndarray, d_theta: np.ndarray) -> int:
+    """
+    Finds the anchor frame index based on median Y-translation.
+    """
+    median_dy = np.median(dy)
+    anchor = np.argmin(np.abs(dy - median_dy))
+    return anchor
+
+def get_anchor_frame_by_median_rotation(d_y: np.ndarray, d_theta: np.ndarray) -> int:
+    """
+    Finds the anchor frame index based on median rotation.
+    """
+    median_theta = np.median(d_theta)
+    anchor = np.argmin(np.abs(d_theta - median_theta))
+    return anchor
 
 def get_stabilization_transform(transforms: np.ndarray, anchor : int  =  -1):
     """
@@ -172,46 +252,101 @@ def to_grey_scale(img: np.ndarray):
     raise ValueError("Unsupported image shape for grayscale conversion.")
 
 
-def build_mosaic(frames: np.ndarray, column_to_build: int =-1 ) -> Tuple[np.ndarray, np.ndarray]:
+def build_mosaic(frames: np.ndarray,  anchor_index_locator_func = None, amount_of_frames: int = None):
     """
     Warps all frames according to the transforms and stitches them into a single mosaic.
     input: asequence of frames that are matrices by 3 channels.
     output: (mosiac by 3 channels, stabilized_frames array)
     """
-    # REMOVED FRAME LIMIT - process all frames
-    # frames = frames[:100]
-    
-    if column_to_build == -1:
+    if anchor_index_locator_func is None:
+        anchor_index_locator_func = get_anchor_frame_by_median_dy
+    if amount_of_frames is None or amount_of_frames == 1:
+        amount_of_frames = 1
         column_to_build = frames.shape[2] // 2
     converted_frames = np.zeros((frames.shape[0], frames.shape[1], frames.shape[2]), dtype=frames.dtype)
-    blurred_frames = np.zeros_like(converted_frames)
     for i in range(len(frames)):
         converted_frames[i] = (to_grey_scale(frames[i])*255).astype(np.uint8)
-        blurred_frames[i] = gaussian_filter(converted_frames[i], sigma=1.0).astype(np.uint8)
-    true_transform, transforms, anchor, global_x_chain = get_first_to_last_transform(blurred_frames)
+    true_transform, transforms, anchor, global_x_chain = get_first_to_last_transform(converted_frames, anchor_index_locator_func=anchor_index_locator_func)
     changes_x_chain = np.zeros(len(global_x_chain))
     sum_rounded_tx = np.zeros(len(global_x_chain))
     changes_x_chain[0] = 0
     sum_rounded_tx[0] = 0
+    # Sum full changes ignoring the fractional parts
     for i in range (1, len(global_x_chain)):
         changes_x_chain[i] = global_x_chain[i] - global_x_chain[i-1]
         sum_rounded_tx[i] = sum_rounded_tx[i-1] + round(changes_x_chain[i])
-    # --- Global X Logic ---
-    # Reconstruct absolute positions relative to the start (Frame 0) based on the pairwise chain.
+    # Sum full changes including fractional parts
+    sum_all_tx = np.zeros(len(global_x_chain))
+    sum_all_tx[0] = 0
+    for i in range (1, len(global_x_chain)):
+        sum_all_tx[i] = sum_all_tx[i-1] + changes_x_chain[i]
+    # Sum full changes ignoring the fractional parts
+
     cum_tx = global_x_chain[-1]
     stabilized_frames = apply_stabilization(frames, true_transform)
     # Calculate bounds based on the cumulative scan
     min_x = np.min(sum_rounded_tx)
     max_x = np.max(sum_rounded_tx)
+    # Alternatively, for fractional tx handling:
+    min_x_f = np.min(sum_all_tx)
+    max_x_f = np.max(sum_all_tx)
+
     # Canvas Width: Span + Frame Width
     canvas_w = int(np.ceil(max_x - min_x + frames.shape[2]))
+    #canvas with for fractional tx handling
+    canvas_w_f = int(np.ceil(max_x_f - min_x_f + frames.shape[2]))
     # Initialize Canvas
-    canvas = np.zeros((frames.shape[1], canvas_w, frames.shape[3]), dtype=frames.dtype)
-    # dominent movment left to right then tx is negative (ignoring all 0 movment frames and positive movments))
+    canvas_array = np.zeros((amount_of_frames,frames.shape[1], canvas_w, frames.shape[3]), dtype=frames.dtype)
+    #intialize canvas for fractional tx handling
+    canvas_array_f = np.zeros((amount_of_frames,frames.shape[1], canvas_w_f, frames.shape[3]), dtype=frames.dtype)    
+    # Calculate safe margins to avoid black triangular regions
+    safe_min_x, safe_max_x = calculate_safe_margins((frames.shape[1], frames.shape[2]), true_transform)
+    valid_width = safe_max_x - safe_min_x
+    print(f"Valid scanning width: {valid_width} (from {safe_min_x} to {safe_max_x})")
+    
+    # Use the safe valid width for scanning (safe_min_x to safe_max_x)
+    width_partical = valid_width // amount_of_frames
+    
+    # adjust for 
+    if amount_of_frames ==1:
+        fill_canvas_from_stabilized_frames(canvas_array[0], stabilized_frames, changes_x_chain, column_to_build, cum_tx)
+        fill_canvas_from_stabilized_frames_fractional(canvas_array_f[0], stabilized_frames, changes_x_chain, column_to_build, cum_tx)
+        return canvas_array[0], canvas_array_f[0], stabilized_frames
+    for i in range(amount_of_frames):
+        # Scan strictly within safe margins
+        column_to_build = safe_min_x + i * width_partical
+        
+        # Ensure we don't exceed safe_max_x
+        if column_to_build >= safe_max_x:
+            column_to_build = safe_max_x - 1
+            
+        fill_canvas_from_stabilized_frames(canvas_array[i], stabilized_frames, changes_x_chain, column_to_build, cum_tx)
+        fill_canvas_from_stabilized_frames_fractional(canvas_array_f[i], stabilized_frames, changes_x_chain, column_to_build, cum_tx)
+    return canvas_array, canvas_array_f, stabilized_frames
+
+
+def fill_canvas_from_stabilized_frames(canvas: np.ndarray, stabilized_frames: np.ndarray, changes_x_chain: np.ndarray, column_to_build: int, cum_tx: int):
+    """
+    Fills the mosaic canvas from the stabilized frames based on the dominant motion direction.
+    input: (canvas by 3 channels, stabilized_frames array, column to build from)
+    output: filled canvas
+    """
+    canvas_w = canvas.shape[1]
+    
+    # Find the last frame with significant movement (> 0.5 pixels)
+    last_significant_idx = 0
+    for i in range(len(changes_x_chain) - 1, -1, -1):
+        if abs(changes_x_chain[i]) > 0.5:
+            last_significant_idx = i
+            break
+            
     if cum_tx <=0:
         canvas[:,:column_to_build,:] = stabilized_frames[0,:,:column_to_build,:]
         cur_column = column_to_build 
-        for i in range (0, len(stabilized_frames)):
+        
+        # Iterate only up to the last significant frame (exclusive)
+        # We will paste the remainder of the last_significant_frame afterwards
+        for i in range (0, last_significant_idx):
             tx = round (changes_x_chain[i])
             if (tx >=0):
                 continue
@@ -220,13 +355,23 @@ def build_mosaic(frames: np.ndarray, column_to_build: int =-1 ) -> Tuple[np.ndar
             except IndexError as e:
                 raise IndexError(f"Error processing frame {i}: cur_column={cur_column}, tx={tx}, column_to_build={column_to_build}, canvas_w={canvas_w}, stabilized_frames shape={stabilized_frames.shape}") from e
             cur_column = cur_column - tx #tx is negative so this is addition
-        #now add the rest of the last frame to the right side of the canvas
-        canvas[:,cur_column:,:]= stabilized_frames[-1,:,column_to_build:,:]
+            
+        #now add the rest of the last significant frame to the right side of the canvas
+        remaining_canvas = canvas_w - cur_column
+        remaining_frame = stabilized_frames.shape[2] - column_to_build
+        # Safety check: only copy what fits
+        columns_to_copy = min(remaining_canvas, remaining_frame)
+        
+        # Use last_significant_idx instead of -1
+        canvas[:,cur_column:cur_column+columns_to_copy,:] = stabilized_frames[last_significant_idx,:,column_to_build:column_to_build+columns_to_copy,:]
     #dominent movment right to left (ignoring all 0 movment frames and negative movments))
     else:
-        canvas[:,canvas_w-column_to_build:,:]= stabilized_frames[0,:,column_to_build:,:]
-        cur_column = canvas_w - column_to_build
-        for i in range (0, len(stabilized_frames)):
+        right_side_of_first_frame = stabilized_frames.shape[2] - column_to_build
+        canvas[:,canvas_w-right_side_of_first_frame:,:]= stabilized_frames[0,:,column_to_build:,:]
+        cur_column = canvas_w - right_side_of_first_frame
+        
+        # Iterate only up to the last significant frame (exclusive)
+        for i in range (0, last_significant_idx):
             tx = round (changes_x_chain[i])
             if (tx <=0):
                 continue
@@ -235,67 +380,63 @@ def build_mosaic(frames: np.ndarray, column_to_build: int =-1 ) -> Tuple[np.ndar
             except IndexError as e:
                 raise IndexError(f"Error processing frame {i}: cur_column={cur_column}, tx={tx}, column_to_build={column_to_build}, canvas_w={canvas_w}, stabilized_frames shape={stabilized_frames.shape}") from e
             cur_column = cur_column - tx #tx is positive so this is subtraction and moves left
-        #now add the rest of the last frame to the left side of the canvas
-        canvas[:,:cur_column,:]= stabilized_frames[-1,:,:column_to_build,:]
-    return canvas, stabilized_frames 
-
-
-def build_mosaic_one_column(frames: np.ndarray, column_to_build: int =-1 ) -> Tuple[np.ndarray, np.ndarray]:
+            
+        #now add the rest of the last significant frame to the left side of the canvas
+        # Use last_significant_idx instead of -1
+        canvas[:,:cur_column,:] = stabilized_frames[last_significant_idx,:,:cur_column,:]
+     
+def fill_canvas_from_stabilized_frames_fractional(canvas: np.ndarray, stabilized_frames: np.ndarray, changes_x_chain: np.ndarray, column_to_build: int, cum_tx: int):
     """
-    Warps all frames according to the transforms and stitches them into a single mosaic.
-    input: asequence of frames that are matrices by 3 channels.
-    output: (mosiac by 3 channels, stabilized_frames array)
+    Fills the mosaic canvas from the stabilized frames based on the dominant motion direction.
+    input: (canvas by 3 channels, stabilized_frames array, column to build from), input tx is a fractional change bewteen frames. 
+    not rounded to integer
+    canvas_w is the sum of all the fractional changes + original frame width
+    output: filled canvas
     """
-    # REMOVED FRAME LIMIT - process all frames
-    # frames = frames[:100]
+    canvas_w = canvas.shape[1]
+    resedual_tx = 0.0
     
-    if column_to_build == -1:
-        column_to_build = frames.shape[2] // 2
-    converted_frames = np.zeros((frames.shape[0], frames.shape[1], frames.shape[2]), dtype=frames.dtype)
-    blurred_frames = np.zeros_like(converted_frames)
-    for i in range(len(frames)):
-        converted_frames[i] = (to_grey_scale(frames[i])*255).astype(np.uint8)
-        blurred_frames[i] = gaussian_filter(converted_frames[i], sigma=1.0).astype(np.uint8)
-    true_transform, transforms, anchor, global_x_chain = get_first_to_last_transform(blurred_frames, get_stabilization_transform_one_pixel_shift)
-    changes_x_chain = np.zeros(len(global_x_chain))
-    sum_rounded_tx = np.zeros(len(global_x_chain))
-    changes_x_chain[0] = 0
-    sum_rounded_tx[0] = 0
-    for i in range (1, len(global_x_chain)):
-        changes_x_chain[i] = true_transform[i,0,2] - true_transform[i-1,0,2]
-        sum_rounded_tx[i] = sum_rounded_tx[i-1] + round(changes_x_chain[-1])
-    # --- Global X Logic ---
-    # Reconstruct absolute positions relative to the start (Frame 0) based on the pairwise chain.
-    cum_tx = np.sum(sum_rounded_tx)
-    stabilized_frames = apply_stabilization(frames, true_transform)
-    # Calculate bounds based on the cumulative scan
-    min_x = np.min(sum_rounded_tx)
-    max_x = np.max(sum_rounded_tx)
-    # Canvas Width: Span + Frame Width
-    canvas_w = int(np.ceil(max_x - min_x + frames.shape[2]))
-    # Initialize Canvas
-    canvas = np.zeros((frames.shape[1], canvas_w, frames.shape[3]), dtype=frames.dtype)
-    # dominent movment left to right then tx is negative (ignoring all 0 movment frames and positive movments))
+    # Find the last frame with significant movement (> 0.5 pixels)
+    last_significant_idx = 0
+    for i in range(len(changes_x_chain) - 1, -1, -1):
+        if abs(changes_x_chain[i]) > 0.5:
+            last_significant_idx = i
+            break
+            
     if cum_tx <=0:
         canvas[:,:column_to_build,:] = stabilized_frames[0,:,:column_to_build,:]
-        cur_column = column_to_build 
-        for i in range (0, len(stabilized_frames)):
-            tx = round (changes_x_chain[i])
-            if (tx >=0):
+        cur_column = column_to_build
+        
+        # Iterate only up to the last significant frame (exclusive)
+        for i in range (0, last_significant_idx):
+            tx_with_resedue = changes_x_chain[i] + resedual_tx
+            resedual_tx = tx_with_resedue - round(tx_with_resedue)
+            tx = round (tx_with_resedue)
+            
+            if (tx >= 0):
                 continue
             try:
                 canvas[:,cur_column : cur_column-tx,:] = stabilized_frames[i,:,column_to_build : column_to_build-tx,:]
             except IndexError as e:
                 raise IndexError(f"Error processing frame {i}: cur_column={cur_column}, tx={tx}, column_to_build={column_to_build}, canvas_w={canvas_w}, stabilized_frames shape={stabilized_frames.shape}") from e
             cur_column = cur_column - tx #tx is negative so this is addition
-        #now add the rest of the last frame to the right side of the canvas
-        canvas[:,cur_column:,:]= stabilized_frames[-1,:,column_to_build:,:]
+            
+        #now add the rest of the last significant frame to the right side of the canvas
+        remaining_canvas = canvas_w - cur_column
+        remaining_frame = stabilized_frames.shape[2] - column_to_build
+        columns_to_copy = min(remaining_canvas, remaining_frame)
+        canvas[:,cur_column:cur_column+columns_to_copy,:] = stabilized_frames[last_significant_idx,:,column_to_build:column_to_build+columns_to_copy,:]
     #dominent movment right to left (ignoring all 0 movment frames and negative movments))
     else:
-        canvas[:,canvas_w-column_to_build:,:]= stabilized_frames[0,:,column_to_build:,:]
-        cur_column = canvas_w - column_to_build
-        for i in range (0, len(stabilized_frames)):
-            tx = round (changes_x_chain[i])
+        right_side_of_first_frame = stabilized_frames.shape[2] - column_to_build
+        canvas[:,canvas_w-right_side_of_first_frame:,:]= stabilized_frames[0,:,column_to_build:,:]
+        cur_column = canvas_w - right_side_of_first_frame
+        
+        # Iterate only up to the last significant frame (exclusive)
+        for i in range (0, last_significant_idx):
+            tx_with_resedue = changes_x_chain[i] + resedual_tx
+            resedual_tx = tx_with_resedue - round(tx_with_resedue)
+            tx = round (tx_with_resedue)
             if (tx <=0):
                 continue
             try:
@@ -303,9 +444,9 @@ def build_mosaic_one_column(frames: np.ndarray, column_to_build: int =-1 ) -> Tu
             except IndexError as e:
                 raise IndexError(f"Error processing frame {i}: cur_column={cur_column}, tx={tx}, column_to_build={column_to_build}, canvas_w={canvas_w}, stabilized_frames shape={stabilized_frames.shape}") from e
             cur_column = cur_column - tx #tx is positive so this is subtraction and moves left
-        #now add the rest of the last frame to the left side of the canvas
-        canvas[:,:cur_column,:]= stabilized_frames[-1,:,:column_to_build,:]
-    return canvas, stabilized_frames 
-    
-    
-
+            
+        #now add the rest of the last significant frame to the left side of the canvas
+        # Use last_significant_idx instead of -1
+        # Fix: copy from the left side of the frame (0 to column_to_build)
+        canvas[:,:cur_column,:] = stabilized_frames[last_significant_idx,:,:cur_column,:]
+     
